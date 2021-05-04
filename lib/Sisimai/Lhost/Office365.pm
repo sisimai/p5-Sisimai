@@ -5,12 +5,12 @@ use strict;
 use warnings;
 
 sub description { 'Microsoft Office 365: https://office.microsoft.com/' }
-sub make {
+sub inquire {
     # Detect an error from Microsoft Office 365
     # @param    [Hash] mhead    Message headers of a bounce email
     # @param    [String] mbody  Message body of a bounce email
     # @return   [Hash]          Bounce data list and message/rfc822 part
-    # @return   [Undef]         failed to parse or the arguments are missing
+    # @return   [undef]         failed to parse or the arguments are missing
     # @since v4.1.3
     my $class = shift;
     my $mhead = shift // return undef;
@@ -26,6 +26,8 @@ sub make {
     # X-MS-Exchange-CrossTenant-FromEntityHeader: Hosted
     # X-MS-Exchange-Transport-CrossTenantHeadersStamped: ...
     $match++ if index($mhead->{'subject'}, 'Undeliverable:') > -1;
+    $match++ if index($mhead->{'subject'}, 'Onbestelbaar:')  > -1;
+    $match++ if index($mhead->{'subject'}, 'Não_entregue:')  > -1;
     $match++ if $mhead->{'x-ms-exchange-message-is-ndr'};
     $match++ if $mhead->{'x-microsoft-antispam-prvs'};
     $match++ if $mhead->{'x-exchange-antispam-report-test'};
@@ -43,12 +45,33 @@ sub make {
     state $indicators = __PACKAGE__->INDICATORS;
     state $rebackbone = qr|^Content-Type:[ ]message/rfc822|m;
     state $markingsof = {
-        'eoe'     => qr/\A(?:Original[ ][Mm]essage[ ][Hh]eaders:?|Message[ ]Hops)/,
-        'error'   => qr/\A(?:Diagnostic[ ]information[ ]for[ ]administrators:|Error[ ]Details)/,
+        'eoe'     => qr{\A(?:
+             Original[ ][Mm]essage[ ][Hh]eaders:?
+            |Message[ ]Hops
+            |Cabe.+alhos[ ]originais[ ]da[ ]mensagem:
+            |Oorspronkelijke[ ]berichtkoppen:
+            )
+        }x,
+        'rfc3464' => qr|\AContent-Type:[ ]message/delivery-status|,
+        'lhost'   => qr{\A(?:
+             Generating[ ]server
+            |Bronserver
+            |Servidor[ ]de[ ]origem
+            ):[ ](.+)\z
+        }x,
+        'error'   => qr{\A(?:
+             Diagnostic[ ]information[ ]for[ ]administrators:
+            |Error[ ]Details
+            |Diagnostische[ ]gegevens[ ]voor[ ]beheerders:
+            |Informa.+es[ ]de[ ]diagn.+stico[ ]para[ ]administradores:
+            )
+        }x,
         'message' => qr{\A(?:
              Delivery[ ]has[ ]failed[ ]to[ ]these[ ]recipients[ ]or[ ]groups:
             |Original[ ]Message[ ]Details
             |.+[ ]rejected[ ]your[ ]message[ ]to[ ]the[ ]following[ ]e[-]?mail[ ]addresses:
+            |Falha[ ]na[ ]entrega[ ]a[ ]estes[ ]destinat.+rios[ ]ou[ ]grupos:
+            |Uw[ ]bericht[ ]kan[ ]niet[ ]worden[ ]bezorgd[ ]bij[ ]de[ ]volgende[ ]geadresseerden[ ]of[ ]groepen:
             )
         }x,
     };
@@ -101,8 +124,8 @@ sub make {
     my $v = undef;
 
     for my $e ( split("\n", $emailsteak->[0]) ) {
-        # Read error messages and delivery status lines from the head of the email
-        # to the previous line of the beginning of the original message.
+        # Read error messages and delivery status lines from the head of the email to the previous
+        # line of the beginning of the original message.
         unless( $readcursor ) {
             # Beginning of the bounce message or message/delivery-status part
             $readcursor |= $indicators->{'deliverystatus'} if $e =~ $markingsof->{'message'};
@@ -133,7 +156,7 @@ sub make {
             $v->{'recipient'} = $1;
             $recipients++;
 
-        } elsif( $e =~ /\AGenerating server: (.+)\z/ ) {
+        } elsif( $e =~ $markingsof->{'lhost'} ) {
             # Generating server: FFFFFFFFFFFF.e0.prod.outlook.com
             $permessage->{'lhost'} = lc $1;
 
@@ -143,27 +166,43 @@ sub make {
                 next unless my $f = Sisimai::RFC1894->match($e);
                 next unless my $o = Sisimai::RFC1894->field($e);
                 next unless exists $fieldtable->{ $o->[0] };
-                next if $o->[0] =~ /\A(?:diagnostic-code|final-recipient)\z/;
-                $v->{ $fieldtable->{ $o->[0] } } = $o->[2];
 
-                next unless $f == 1;
-                $permessage->{ $fieldtable->{ $o->[0] } } = $o->[2];
+                if( $v->{'diagnosis'} ) {
+                    # Do not capture "Diagnostic-Code:" field because error message have already
+                    # been captured
+                    next if $o->[0] =~ /\A(?:diagnostic-code|final-recipient)\z/;
+                    $v->{ $fieldtable->{ $o->[0] } } = $o->[2];
 
+                    next unless $f == 1;
+                    $permessage->{ $fieldtable->{ $o->[0] } } = $o->[2];
+
+                } else {
+                    # Capture "Diagnostic-Code:" field because no error messages have been captured
+                    $v->{ $fieldtable->{ $o->[0] } } = $o->[2];
+                    $permessage->{ $fieldtable->{ $o->[0] } } = $o->[2];
+                }
             } else {
                 if( $e =~ $markingsof->{'error'} ) {
                     # Diagnostic information for administrators:
                     $v->{'diagnosis'} = $e;
+
                 } else {
                     # kijitora@example.com
                     # Remote Server returned '550 5.1.10 RESOLVER.ADR.RecipientNotFound; Recipien=
                     # t not found by SMTP address lookup'
-                    next unless $v->{'diagnosis'};
-                    if( $e =~ $markingsof->{'eoe'} ) {
-                        # Original message headers:
-                        $endoferror = 1;
-                        next;
+                    if( $v->{'diagnosis'} ) {
+                        # The error message text have already captured
+                        if( $e =~ $markingsof->{'eoe'} ) {
+                            # Original message headers:
+                            $endoferror = 1;
+                            next;
+                        }
+                        $v->{'diagnosis'} .= ' '.$e;
+
+                    } else {
+                        # The error message text has not been captured yet
+                        $endoferror = 1 if $e =~ $markingsof->{'rfc3464'};
                     }
-                    $v->{'diagnosis'} .= ' '.$e;
                 }
             }
         }
@@ -214,8 +253,8 @@ Sisimai::Lhost::Office365 - bounce mail parser class for Microsoft Office 365.
 
 =head1 DESCRIPTION
 
-Sisimai::Lhost::Office365 parses a bounce email which created by Microsoft
-Office 365. Methods in the module are called from only Sisimai::Message.
+Sisimai::Lhost::Office365 parses a bounce email which created by Microsoft Office 365. Methods in
+the module are called from only Sisimai::Message.
 
 =head1 CLASS METHODS
 
@@ -225,10 +264,10 @@ C<description()> returns description string of this module.
 
     print Sisimai::Lhost::Office365->description;
 
-=head2 C<B<make(I<header data>, I<reference to body string>)>>
+=head2 C<B<inquire(I<header data>, I<reference to body string>)>>
 
-C<make()> method parses a bounced email and return results as a array reference.
-See Sisimai::Message for more details.
+C<inquire()> method parses a bounced email and return results as a array reference. See Sisimai::Message
+for more details.
 
 =head1 AUTHOR
 
@@ -236,7 +275,7 @@ azumakuniyuki
 
 =head1 COPYRIGHT
 
-Copyright (C) 2016-2020 azumakuniyuki, All rights reserved.
+Copyright (C) 2016-2021 azumakuniyuki, All rights reserved.
 
 =head1 LICENSE
 
